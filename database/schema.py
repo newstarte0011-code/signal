@@ -1,4 +1,3 @@
-
 import logging
 
 from database.connection import database_transaction
@@ -31,6 +30,7 @@ CREATE TABLE IF NOT EXISTS raw_messages (
     content_hash TEXT,
     has_media INTEGER NOT NULL DEFAULT 0
         CHECK (has_media IN (0, 1)),
+    reply_to_message_id INTEGER,
     collection_status TEXT NOT NULL DEFAULT 'collected'
         CHECK (
             collection_status IN (
@@ -82,10 +82,18 @@ CREATE TABLE IF NOT EXISTS signals (
         CHECK (extraction_method IN ('rules', 'ai', 'manual')),
     validation_status TEXT NOT NULL DEFAULT 'pending'
         CHECK (
-            validation_status IN ('pending', 'valid', 'invalid', 'ambiguous')
+            validation_status IN (
+                'pending',
+                'valid',
+                'invalid',
+                'ambiguous'
+            )
         ),
     confidence REAL
-        CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+        CHECK (
+            confidence IS NULL
+            OR (confidence >= 0 AND confidence <= 1)
+        ),
     published_at TEXT NOT NULL,
     extracted_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -135,7 +143,12 @@ CREATE TABLE IF NOT EXISTS candles (
     CHECK (high >= low),
     CHECK (high >= open AND high >= close),
     CHECK (low <= open AND low <= close),
-    UNIQUE (source, instrument, timeframe, candle_open_time)
+    UNIQUE (
+        source,
+        instrument,
+        timeframe,
+        candle_open_time
+    )
 );
 
 CREATE TABLE IF NOT EXISTS backtest_runs (
@@ -155,7 +168,14 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
         CHECK (entry_expiry_minutes >= 0),
     execution_rules_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+        CHECK (
+            status IN (
+                'pending',
+                'running',
+                'completed',
+                'failed'
+            )
+        ),
     started_at TEXT,
     finished_at TEXT,
     error_message TEXT,
@@ -182,10 +202,47 @@ CREATE INDEX IF NOT EXISTS idx_backtest_runs_status
 """
 
 
+def _ensure_reply_to_message_column(connection) -> None:
+    """
+    Add the reply_to_message_id column to older databases.
+
+    New databases already contain this column in SCHEMA_SQL.
+    Existing databases receive the column only when it is missing.
+    """
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(raw_messages)"
+        ).fetchall()
+    }
+
+    if not columns:
+        raise RuntimeError(
+            "The raw_messages table does not exist."
+        )
+
+    if "reply_to_message_id" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE raw_messages
+            ADD COLUMN reply_to_message_id INTEGER
+            """
+        )
+
+        logger.info(
+            "Database migration applied: "
+            "raw_messages.reply_to_message_id"
+        )
+
+
 def _remove_message_hash_uniqueness(connection) -> None:
     """
-    Remove the legacy UNIQUE(raw_message_id, content_hash) constraint
-    without deleting existing message versions.
+    Remove a legacy UNIQUE(raw_message_id, content_hash) constraint
+    while preserving all existing message versions.
+
+    The current schema uses UNIQUE(raw_message_id, version_number).
+    This migration is needed only for databases created with the
+    older constraint.
     """
     indexes = connection.execute(
         "PRAGMA index_list('message_versions')"
@@ -196,13 +253,20 @@ def _remove_message_hash_uniqueness(connection) -> None:
             continue
 
         index_name = index["name"].replace('"', '""')
+
         columns = connection.execute(
             f'PRAGMA index_info("{index_name}")'
         ).fetchall()
 
-        column_names = [column["name"] for column in columns]
+        column_names = [
+            column["name"]
+            for column in columns
+        ]
 
-        if column_names != ["raw_message_id", "content_hash"]:
+        if column_names != [
+            "raw_message_id",
+            "content_hash",
+        ]:
             continue
 
         logger.warning(
@@ -210,11 +274,14 @@ def _remove_message_hash_uniqueness(connection) -> None:
         )
 
         connection.execute(
-            "ALTER TABLE message_versions "
-            "RENAME TO message_versions_old"
+            """
+            ALTER TABLE message_versions
+            RENAME TO message_versions_old
+            """
         )
 
-        connection.execute("""
+        connection.execute(
+            """
             CREATE TABLE message_versions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 raw_message_id INTEGER NOT NULL,
@@ -228,9 +295,11 @@ def _remove_message_hash_uniqueness(connection) -> None:
                     ON DELETE RESTRICT,
                 UNIQUE (raw_message_id, version_number)
             )
-        """)
+            """
+        )
 
-        connection.execute("""
+        connection.execute(
+            """
             INSERT INTO message_versions (
                 id,
                 raw_message_id,
@@ -249,18 +318,27 @@ def _remove_message_hash_uniqueness(connection) -> None:
                 edit_date,
                 observed_at
             FROM message_versions_old
-        """)
+            """
+        )
 
         connection.execute(
             "DROP TABLE message_versions_old"
         )
 
-        logger.info("message_versions migration completed.")
+        logger.info(
+            "message_versions migration completed."
+        )
+
         return
 
 
 def initialize_schema(database_path=None) -> None:
-    """Create all tables and indexes and apply the legacy migration."""
+    """
+    Create database tables and indexes.
+
+    Also applies migrations required by existing databases.
+    All schema changes are executed in one transaction.
+    """
     statements = [
         statement.strip()
         for statement in SCHEMA_SQL.split(";")
@@ -271,6 +349,10 @@ def initialize_schema(database_path=None) -> None:
         for statement in statements:
             connection.execute(statement)
 
+        _ensure_reply_to_message_column(connection)
+
         _remove_message_hash_uniqueness(connection)
 
-    logger.info("Database schema initialized successfully.")
+    logger.info(
+        "Database schema initialized successfully."
+    )
