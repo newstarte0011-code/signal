@@ -19,7 +19,12 @@ from typing import Any
 
 from database.connection import database_connection, database_transaction
 
-PARSER_VERSION = "0.5.0"
+PARSER_VERSION = "0.6.0-channel-parsers"
+
+try:
+    from parser.registry import parse_for_channel
+except ImportError:  # Supports running a copied script before parser package installation.
+    parse_for_channel = None
 logger = logging.getLogger("parse_signals")
 
 NUM_RE = re.compile(r"(?<![A-Za-z])\d+(?:[.,]\d+)?")
@@ -283,7 +288,7 @@ def classify(message: dict[str, Any]) -> tuple[str, dict[str, Any], list[str]]:
 
 
 def _message_row(message: dict[str, Any], source_file: str = "") -> dict[str, Any]:
-    category, fields, reasons = classify(message)
+    """Normalize one message using its dedicated channel parser when available."""
     current_text = (
         message.get("current_text")
         or message.get("text")
@@ -291,22 +296,65 @@ def _message_row(message: dict[str, Any], source_file: str = "") -> dict[str, An
         or message.get("message")
         or ""
     )
+    parsed = None
+    parser_name = "generic_rules"
+    if parse_for_channel is not None:
+        parsed, resolved_name = parse_for_channel({**message, "current_text": current_text})
+        if parsed is not None:
+            parser_name = resolved_name or parsed.parser_name
+
+    if parsed is not None:
+        data = parsed.to_dict()
+        tp_values = list(data.get("take_profits") or [])
+        take_profits = {f"tp{i}": value for i, value in enumerate(tp_values, start=1)}
+        category = data.get("category", "OTHER")
+        flags = list(data.get("validation_flags") or [])
+        backtest_eligible = bool(data.get("backtest_eligible")) and not flags
+        if message.get("collection_status") == "edited" or message.get("edit_date"):
+            category = "REJECTED_SIGNAL"
+            flags.append("source_message_edited")
+            flags = list(dict.fromkeys(flags))
+            backtest_eligible = False
+        fields = {
+            "symbol": data.get("symbol"),
+            "direction": data.get("direction"),
+            "entry": data.get("entry"),
+            "entry_min": data.get("entry_min"),
+            "entry_max": data.get("entry_max"),
+            "take_profits": take_profits,
+            "stop_loss": data.get("stop_loss"),
+        }
+        extraction_method = data.get("extraction_method", "rules")
+        parser_version = data.get("parser_version", PARSER_VERSION)
+        confidence = data.get("confidence", 0.0)
+    else:
+        category, fields, flags = classify(message)
+        backtest_eligible = category == "TRADE_SIGNAL" and not flags
+        extraction_method = "rules"
+        parser_version = PARSER_VERSION
+        confidence = 1.0 if backtest_eligible else 0.0
+        if message.get("collection_status") == "edited" or message.get("edit_date"):
+            category = "REJECTED_SIGNAL" if category in {"TRADE_SIGNAL", "REJECTED_SIGNAL"} else category
+            flags = list(dict.fromkeys([*flags, "source_message_edited"]))
+            backtest_eligible = False
+
     return {
-        "parser_version": PARSER_VERSION,
+        "parser_version": parser_version,
+        "parser_name": parser_name,
         "source_file": source_file,
         "raw_message_id": message.get("id") or message.get("raw_message_id"),
         "telegram_message_id": message.get("telegram_message_id") or message.get("message_id"),
         "channel_id": message.get("channel_id"),
-        "message_date": message.get("message_date") or message.get("date_utc")
-        or message.get("date") or message.get("date_local"),
+        "message_date": message.get("message_date") or message.get("date_utc") or message.get("date") or message.get("date_local"),
         "edit_date": message.get("edit_date") or message.get("edit_date_utc"),
         "channel_username": message.get("channel_username"),
         "channel_title": message.get("channel_title"),
         "category": category,
         **fields,
-        "validation_flags": reasons,
-        "backtest_eligible": category == "TRADE_SIGNAL" and not reasons,
-        "extraction_method": "rules",
+        "validation_flags": flags,
+        "backtest_eligible": backtest_eligible,
+        "extraction_method": extraction_method,
+        "confidence": confidence,
         "has_media": bool(message.get("has_media")),
         "current_text": current_text,
     }
@@ -364,7 +412,49 @@ def process_database(limit: int | None = None, channel_id: int | None = None) ->
             row = _message_row(raw)
             category = row["category"]
             counts[category] += 1
+            raw_message_id = int(raw["id"])
+            existing = connection.execute(
+                "SELECT * FROM signals WHERE raw_message_id = ? AND signal_index = 0",
+                (raw_message_id,),
+            ).fetchone()
+            edited_source = raw.get("collection_status") == "edited" or bool(raw.get("edit_date"))
+
+            # Critical edit safety: if an edited message no longer parses as a
+            # signal, its previously stored signal must still be invalidated.
             if category not in {"TRADE_SIGNAL", "REJECTED_SIGNAL"}:
+                if existing and edited_source:
+                    signal_id = int(existing["id"])
+                    connection.execute(
+                        "UPDATE signals SET validation_status='ambiguous', confidence=0, updated_at=? WHERE id=?",
+                        (now, signal_id),
+                    )
+                    previous_version = connection.execute(
+                        "SELECT COALESCE(MAX(version_number), 0) AS n FROM signal_versions WHERE signal_id=?",
+                        (signal_id,),
+                    ).fetchone()
+                    version_number = int(previous_version["n"]) + 1
+                    snapshot = {
+                        "parser_version": row.get("parser_version", PARSER_VERSION),
+                        "parser_name": row.get("parser_name", "generic_rules"),
+                        "category": category,
+                        "source_message_edited": True,
+                        "backtest_eligible": False,
+                        "validation_flags": list(dict.fromkeys([*(row.get("validation_flags") or []), "source_message_edited", "edited_message_no_longer_signal"])),
+                        "current_text": row.get("current_text", ""),
+                    }
+                    connection.execute(
+                        """INSERT INTO signal_versions (
+                            signal_id, version_number, source_message_edit_date,
+                            direction, entry_min, entry_max, stop_loss, take_profit_1,
+                            take_profit_2, take_profit_3, snapshot_json, recorded_at,
+                            is_original, notes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+                        (signal_id, version_number, raw.get("edit_date"), existing["direction"],
+                         existing["entry_min"], existing["entry_max"], existing["stop_loss"],
+                         existing["take_profit_1"], existing["take_profit_2"], existing["take_profit_3"],
+                         json.dumps(snapshot, ensure_ascii=False, sort_keys=True), now,
+                         "source_message_edited;edited_message_no_longer_signal"),
+                    )
                 continue
 
             take_profits = row["take_profits"]
@@ -378,13 +468,6 @@ def process_database(limit: int | None = None, channel_id: int | None = None) ->
             instrument = row.get("symbol") or "XAUUSD"
             published_at = row.get("message_date") or now
             extracted_at = now
-            raw_message_id = int(raw["id"])
-
-            existing = connection.execute(
-                "SELECT id FROM signals WHERE raw_message_id = ? AND signal_index = 0",
-                (raw_message_id,),
-            ).fetchone()
-
             values = (
                 instrument,
                 row.get("direction"),
@@ -438,7 +521,9 @@ def process_database(limit: int | None = None, channel_id: int | None = None) ->
                 is_original = 1
 
             snapshot = {
-                "parser_version": PARSER_VERSION,
+                "parser_version": row.get("parser_version", PARSER_VERSION),
+                "parser_name": row.get("parser_name", "generic_rules"),
+                "confidence": row.get("confidence", 0.0),
                 "category": category,
                 "instrument": instrument,
                 "direction": row.get("direction"),
