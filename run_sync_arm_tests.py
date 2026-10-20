@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Offline tests: use temporary databases or local configuration where possible.
 OFFLINE_TESTS = [
@@ -120,12 +120,9 @@ def main() -> int:
     print(f"\nPassed: {passed} | Failed: {failed} | Skipped: {skipped}", flush=True)
     if not run_live:
         print("Live Telegram tests were not run. Add --live to include them.", flush=True)
-    try:
-        input("\nPress Enter to close...")
-    except EOFError:
-        pass
     return 1 if failed else 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+    
