@@ -152,10 +152,16 @@ def _validate_message(
     telegram_message_id: int,
     message_date: str,
 ) -> None:
-    if telegram_message_id <= 0:
-        raise ValueError("telegram_message_id must be positive.")
-    if not message_date:
-        raise ValueError("message_date cannot be empty.")
+    """Validate the required Telegram message identifiers and timestamp."""
+    if (
+        not isinstance(telegram_message_id, int)
+        or isinstance(telegram_message_id, bool)
+        or telegram_message_id <= 0
+    ):
+        raise ValueError("telegram_message_id must be a positive integer.")
+
+    if not isinstance(message_date, str) or not message_date.strip():
+        raise ValueError("message_date must be a non-empty string.")
 
 
 def _save_raw_message_in_connection(
@@ -168,13 +174,18 @@ def _save_raw_message_in_connection(
     has_media: bool,
     reply_to_message_id: Optional[int] = None,
 ) -> int:
-    """Insert/update one message using an already-open transaction."""
+    """Insert or update one message within an existing transaction.
+
+    Message text changes are recorded as immutable versions. Any observed
+    edit invalidates signals extracted from the prior text by marking them
+    ambiguous until the parser re-processes the message.
+    """
     content_hash = hash_text(text)
     now = utc_now()
 
     existing = connection.execute(
         """
-        SELECT id, content_hash
+        SELECT id, content_hash, edit_date, collection_status
         FROM raw_messages
         WHERE channel_id = ? AND telegram_message_id = ?
         """,
@@ -190,7 +201,7 @@ def _save_raw_message_in_connection(
                 edit_date, content_hash, has_media, reply_to_message_id,
                 collection_status, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'collected', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 channel_id,
@@ -202,6 +213,7 @@ def _save_raw_message_in_connection(
                 content_hash,
                 int(has_media),
                 reply_to_message_id,
+                "edited" if edit_date else "collected",
                 now,
                 now,
             ),
@@ -222,8 +234,14 @@ def _save_raw_message_in_connection(
         return raw_message_id
 
     raw_message_id = int(existing["id"])
+    old_edit_date = existing["edit_date"]
+    text_changed = existing["content_hash"] != content_hash
+    edit_metadata_changed = (
+        edit_date is not None and edit_date != old_edit_date
+    )
+    edit_observed = text_changed or edit_metadata_changed
 
-    if existing["content_hash"] == content_hash:
+    if not text_changed:
         connection.execute(
             """
             UPDATE raw_messages
@@ -231,11 +249,34 @@ def _save_raw_message_in_connection(
                 edit_date = COALESCE(?, edit_date),
                 has_media = MAX(has_media, ?),
                 reply_to_message_id = COALESCE(?, reply_to_message_id),
+                collection_status = CASE
+                    WHEN ? = 1 THEN 'edited'
+                    ELSE collection_status
+                END,
                 updated_at = ?
             WHERE id = ?
             """,
-            (edit_date, int(has_media), reply_to_message_id, now, raw_message_id),
+            (
+                edit_date,
+                int(has_media),
+                reply_to_message_id,
+                int(edit_observed),
+                now,
+                raw_message_id,
+            ),
         )
+
+        if edit_observed:
+            connection.execute(
+                """
+                UPDATE signals
+                SET validation_status = 'ambiguous',
+                    updated_at = ?
+                WHERE raw_message_id = ?
+                """,
+                (now, raw_message_id),
+            )
+
         return raw_message_id
 
     latest = connection.execute(
@@ -270,6 +311,7 @@ def _save_raw_message_in_connection(
         """
         UPDATE raw_messages
         SET
+            message_date = ?,
             text = ?,
             edit_date = ?,
             content_hash = ?,
@@ -280,6 +322,7 @@ def _save_raw_message_in_connection(
         WHERE id = ?
         """,
         (
+            message_date,
             text,
             edit_date,
             content_hash,
@@ -289,8 +332,19 @@ def _save_raw_message_in_connection(
             raw_message_id,
         ),
     )
-    logger.debug(
-        "Message version recorded: id=%s, version=%s",
+
+    connection.execute(
+        """
+        UPDATE signals
+        SET validation_status = 'ambiguous',
+            updated_at = ?
+        WHERE raw_message_id = ?
+        """,
+        (now, raw_message_id),
+    )
+
+    logger.info(
+        "Message edit recorded: raw_message_id=%s, version=%s",
         raw_message_id,
         next_version,
     )
@@ -309,6 +363,13 @@ def save_raw_messages_batch(
     Optional keys: edit_date and has_media.
     The batch is atomic: if any item fails, the entire batch rolls back.
     """
+    if (
+        not isinstance(channel_id, int)
+        or isinstance(channel_id, bool)
+        or channel_id <= 0
+    ):
+        raise ValueError("channel_id must be a positive integer.")
+
     if not messages:
         return []
 
@@ -321,14 +382,34 @@ def save_raw_messages_batch(
         message_date = item.get("message_date")
         _validate_message(telegram_message_id, message_date)
 
+        reply_to_message_id = item.get("reply_to_message_id")
+        if reply_to_message_id is not None and (
+            not isinstance(reply_to_message_id, int)
+            or isinstance(reply_to_message_id, bool)
+            or reply_to_message_id <= 0
+        ):
+            raise ValueError(
+                "reply_to_message_id must be a positive integer or None."
+            )
+
+        text = item.get("text")
+        if text is not None and not isinstance(text, str):
+            raise TypeError("message text must be a string or None.")
+
+        edit_date = item.get("edit_date")
+        if edit_date is not None and (
+            not isinstance(edit_date, str) or not edit_date.strip()
+        ):
+            raise ValueError("edit_date must be a non-empty string or None.")
+
         prepared.append(
             {
                 "telegram_message_id": telegram_message_id,
                 "message_date": message_date,
-                "text": item.get("text"),
-                "edit_date": item.get("edit_date"),
+                "text": text,
+                "edit_date": edit_date,
                 "has_media": bool(item.get("has_media", False)),
-                "reply_to_message_id": item.get("reply_to_message_id"),
+                "reply_to_message_id": reply_to_message_id,
             }
         )
 
@@ -451,20 +532,43 @@ def get_message_versions(
         ).fetchall()
     return [dict(row) for row in rows]
 
-def mark_message_edited(channel_id: int, telegram_message_id: int) -> None:
-    """Mark a Telegram message as edited for future ranking penalties."""
-    from database.connection import database_transaction
+def mark_message_edited(
+    channel_id: int,
+    telegram_message_id: int,
+    database_path: Optional[Path] = None,
+) -> None:
+    """Mark a message edited and invalidate signals extracted from it.
 
-    with database_transaction() as conn:
-        cursor = conn.execute(
+    The signals are marked ambiguous until the message is parsed and
+    validated again. The optional database_path keeps this helper
+    consistent with the other repository functions.
+    """
+    if (
+        not isinstance(channel_id, int)
+        or isinstance(channel_id, bool)
+        or channel_id <= 0
+    ):
+        raise ValueError("channel_id must be a positive integer.")
+
+    if (
+        not isinstance(telegram_message_id, int)
+        or isinstance(telegram_message_id, bool)
+        or telegram_message_id <= 0
+    ):
+        raise ValueError("telegram_message_id must be a positive integer.")
+
+    now = utc_now()
+
+    with database_transaction(database_path) as connection:
+        cursor = connection.execute(
             """
             UPDATE raw_messages
             SET collection_status = 'edited',
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = ?
             WHERE channel_id = ?
               AND telegram_message_id = ?
             """,
-            (channel_id, telegram_message_id),
+            (now, channel_id, telegram_message_id),
         )
 
         if cursor.rowcount == 0:
@@ -473,3 +577,18 @@ def mark_message_edited(channel_id: int, telegram_message_id: int) -> None:
                 f"channel_id={channel_id}, "
                 f"telegram_message_id={telegram_message_id}"
             )
+
+        connection.execute(
+            """
+            UPDATE signals
+            SET validation_status = 'ambiguous',
+                updated_at = ?
+            WHERE raw_message_id = (
+                SELECT id
+                FROM raw_messages
+                WHERE channel_id = ?
+                  AND telegram_message_id = ?
+            )
+            """,
+            (now, channel_id, telegram_message_id),
+        )
