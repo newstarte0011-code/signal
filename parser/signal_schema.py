@@ -227,3 +227,4 @@ def validate_signal(signal: SignalSchema) -> tuple[str, ...]:
         problems.append("duplicate_tp_price")
 
     return tuple(dict.fromkeys(problems))
+
