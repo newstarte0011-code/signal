@@ -148,3 +148,4 @@ def extract_number(value: str) -> float | None:
         return float(match.group().replace(",", "."))
     except ValueError:
         return None
+
