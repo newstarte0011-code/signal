@@ -1,8 +1,13 @@
-"""SQLite connection helpers for Signal Analyzer.
-
-This module deliberately does not create or migrate tables. Run the project's
-schema initializer separately so database structure changes remain explicit.
 """
+SQLite connection management for Signal Analyzer.
+
+Database location:
+    <project_root>/data/signal_analyzer.db
+
+The database path can be overridden using:
+    SIGNAL_DATABASE_PATH=/absolute/or/relative/path.db
+"""
+
 from __future__ import annotations
 
 import os
@@ -11,66 +16,102 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "signal_analyzer.db"
+
+# connection.py is located in <project_root>/database/.
+# parents[1] therefore points to <project_root>.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+DEFAULT_DATABASE_PATH = (
+    PROJECT_ROOT / "data" / "signal_analyzer.db"
+)
 
 
-def resolve_database_path(database_path: str | Path | None = None) -> Path:
-    """Resolve an explicit path or SIGNAL_DATABASE_PATH, then the project default."""
-    raw_path = database_path if database_path is not None else os.getenv("SIGNAL_DATABASE_PATH")
-    path = Path(raw_path).expanduser() if raw_path else DEFAULT_DATABASE_PATH
+def get_database_path() -> Path:
+    """
+    Return the configured SQLite database path.
+
+    Relative SIGNAL_DATABASE_PATH values are resolved relative
+    to the project root, not the current working directory.
+    """
+
+    configured_path = os.getenv("SIGNAL_DATABASE_PATH")
+
+    if not configured_path:
+        return DEFAULT_DATABASE_PATH
+
+    path = Path(configured_path).expanduser()
+
     if not path.is_absolute():
         path = PROJECT_ROOT / path
+
     return path.resolve()
 
 
-def _open_connection(database_path: str | Path | None = None) -> sqlite3.Connection:
-    path = resolve_database_path(database_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(
-        str(path),
-        timeout=30.0,
-        isolation_level=None,
+def get_connection() -> sqlite3.Connection:
+    """
+    Create and return a SQLite connection.
+
+    The parent directory is created if it does not exist.
+    Foreign-key enforcement is enabled for this connection.
+    """
+
+    database_path = get_database_path()
+    database_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
+
+    connection = sqlite3.connect(
+        str(database_path),
+        timeout=30.0,
+    )
+
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 30000")
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA synchronous = NORMAL")
+
     return connection
 
 
 @contextmanager
-def database_connection(
-    database_path: str | Path | None = None,
-) -> Iterator[sqlite3.Connection]:
-    """Yield a configured connection and always close it.
-
-    This context does not implicitly wrap operations in a transaction. Use
-    database_transaction() when a group of writes must succeed or roll back
-    together.
+def database_transaction() -> Iterator[sqlite3.Connection]:
     """
-    connection = _open_connection(database_path)
-    try:
-        yield connection
-    finally:
-        connection.close()
+    Execute operations inside a transaction.
 
+    Commits when the block succeeds and rolls back if an exception
+    occurs. The connection is always closed.
+    """
 
-@contextmanager
-def database_transaction(
-    database_path: str | Path | None = None,
-) -> Iterator[sqlite3.Connection]:
-    """Run operations in one transaction; commit on success, roll back on error."""
-    connection = _open_connection(database_path)
+    connection = get_connection()
+
     try:
-        connection.execute("BEGIN IMMEDIATE")
-        try:
+        with connection:
             yield connection
-        except BaseException:
-            connection.rollback()
-            raise
-        else:
-            connection.commit()
     finally:
         connection.close()
+
+
+def initialize_database() -> None:
+    """
+    Create an empty SQLite database file if needed.
+
+    This function does not create application tables.
+    Table creation and migrations belong to schema.py.
+    """
+
+    connection = get_connection()
+    connection.close()
+
+
+def get_database_info() -> dict[str, str]:
+    """
+    Return basic information about the configured database.
+    """
+
+    database_path = get_database_path()
+
+    return {
+        "project_root": str(PROJECT_ROOT),
+        "database_path": str(database_path),
+        "database_exists": str(database_path.is_file()),
+    }
